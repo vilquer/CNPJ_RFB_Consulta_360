@@ -1,0 +1,387 @@
+# grafo.py
+"""Grafo de vínculos societários: empresas ↔ sócios (PF/PJ) ↔ representantes.
+
+BFS por níveis a partir de uma semente, sobre o quadro societário
+(HIST_GOVBR_CNPJ_SOCIO_DEX). Identidade dos nós:
+- empresa: MIOLO_CNPJ (8 dígitos) — filiais são atributo, não nó (opcional).
+- sócio PF: (nome, cpf mascarado) — o CPF vem mascarado da RFB (***XXXXXX**),
+  então nome+máscara é a melhor chave disponível; colisão é possível mas rara.
+- sócio PJ: 8 primeiros dígitos de CPF_CNPJ_SOCIO — vira nó de empresa e pode
+  ser expandido no nível seguinte.
+"""
+
+from dataclasses import dataclass, field
+
+import pandas as pd
+import streamlit as st
+
+from lib import consultas as c
+from lib import db
+
+# Sócio ligado a mais empresas que isso não é expandido (fundos, bancos,
+# holdings estatais explodem o grafo). O nó fica marcado como hub.
+LIMITE_HUB = 40
+
+
+@dataclass
+class Grafo:
+    nos: dict = field(default_factory=dict)      # id -> dict de atributos
+    arestas: dict = field(default_factory=dict)  # (origem, destino) -> (rótulo, desde)
+    truncado: bool = False
+    hubs: list = field(default_factory=list)
+
+
+def _chave_pf(nome: str, cpf: str) -> str:
+    return f"pf:{(nome or '').strip()}|{(cpf or '').strip()}"
+
+
+@st.cache_data(ttl=3600, max_entries=200)
+def _socios_das_empresas(basicos: tuple) -> pd.DataFrame:
+    filtro, binds = db.in_clause("s.MIOLO_CNPJ", list(basicos))
+    return db.query(f"""
+        SELECT s.MIOLO_CNPJ AS cnpj_basico,
+               {c.DECODE_TIPO_SOCIO} AS tipo_socio,
+               s.NOME_RAZAO_SOCIAL AS nome_socio,
+               s.CPF_CNPJ_SOCIO AS cpf_cnpj_socio,
+               q.DESCR_QUALIFICACAO AS qualificacao,
+               fx.FAIXA_ETARIA AS faixa_etaria,
+               TO_CHAR(s.DATA_INICIO, 'DD/MM/YYYY') AS data_entrada_sociedade,
+               p.PAIS AS pais_socio,
+               s.CPF_REPRESENTANTE_LEGAL AS representante_legal,
+               s.NOME_REPRESENTANTE_LEGAL AS nome_representante,
+               qr.DESCR_QUALIFICACAO AS qualificacao_representante
+        FROM {c.SOC} s
+        LEFT JOIN {c.DEX_QUALIF} q ON s.COD_QUALIFICACAO_SOCIO = q.COD_QUALIFICACAO
+        LEFT JOIN {c.DEX_QUALIF} qr
+          ON s.COD_QUALIFICACAO_REPRESENTANTE = qr.COD_QUALIFICACAO
+        LEFT JOIN {c.DEX_FAIXA} fx ON s.COD_FAIXA_ETARIA = fx.COD_FAIXA_ETARIA
+        LEFT JOIN {c.DEX_PAIS} p ON s.COD_PAIS = p.COD_PAIS
+        WHERE s.DATA_REFERENCIA = :safra AND {filtro}
+    """, {"safra": c.safra_de(c.SOC), **binds})
+
+
+@st.cache_data(ttl=3600, max_entries=200)
+def _empresas_dos_socios_pf(pares: tuple) -> pd.DataFrame:
+    """pares = tuplas (nome, cpf_mascarado). Volta todas as empresas em que
+    essas pessoas aparecem como sócias. IN multi-coluna, em blocos de 1000
+    (limite do Oracle por lista)."""
+    binds: dict = {"safra": c.safra_de(c.SOC)}
+    grupos = []
+    for g0 in range(0, len(pares), 1000):
+        itens = []
+        for i, (nome, cpf) in enumerate(pares[g0:g0 + 1000], start=g0):
+            binds[f"n{i}"], binds[f"c{i}"] = nome, cpf
+            itens.append(f"(:n{i}, :c{i})")
+        grupos.append(
+            f"(s.NOME_RAZAO_SOCIAL, s.CPF_CNPJ_SOCIO) IN ({', '.join(itens)})")
+    return db.query(f"""
+        SELECT s.MIOLO_CNPJ AS cnpj_basico,
+               s.NOME_RAZAO_SOCIAL AS nome_socio,
+               s.CPF_CNPJ_SOCIO AS cpf_cnpj_socio,
+               q.DESCR_QUALIFICACAO AS qualificacao,
+               TO_CHAR(s.DATA_INICIO, 'DD/MM/YYYY') AS data_entrada_sociedade
+        FROM {c.SOC} s
+        LEFT JOIN {c.DEX_QUALIF} q ON s.COD_QUALIFICACAO_SOCIO = q.COD_QUALIFICACAO
+        WHERE s.DATA_REFERENCIA = :safra AND ({' OR '.join(grupos)})
+    """, binds)
+
+
+@st.cache_data(ttl=3600, max_entries=200)
+def _dados_empresas(basicos: tuple) -> pd.DataFrame:
+    filtro_emp, binds_emp = db.in_clause("emp.MIOLO_CNPJ", list(basicos), "e")
+    filtro_est, binds_est = db.in_clause("e.MIOLO_CNPJ", list(basicos), "s")
+    return db.query(f"""
+        WITH est AS (
+            SELECT e.MIOLO_CNPJ, e.COD_CLIENTE, e.IND_MATRIZ_FILIAL,
+                   e.COD_SITUACAO_RECEITA, e.UF, e.COD_MUNICIPIO,
+                   e.COD_CNAE_PRINCIPAL
+            FROM {c.EST} e
+            WHERE e.DATA_REFERENCIA = :safra_est AND {filtro_est}
+        ),
+        matriz AS (
+            SELECT e.MIOLO_CNPJ, e.COD_CLIENTE, e.COD_SITUACAO_RECEITA,
+                   e.UF, e.COD_MUNICIPIO, e.COD_CNAE_PRINCIPAL
+            FROM est e WHERE e.IND_MATRIZ_FILIAL = '{c.COD_MATRIZ}'
+        ),
+        agreg AS (
+            SELECT e.MIOLO_CNPJ, COUNT(*) AS n_estab,
+                   SUM(CASE WHEN e.COD_SITUACAO_RECEITA = :ativa
+                            THEN 1 ELSE 0 END) AS n_ativos
+            FROM est e GROUP BY e.MIOLO_CNPJ
+        )
+        SELECT emp.MIOLO_CNPJ AS cnpj_basico, emp.RAZAO_SOCIAL AS razao_social,
+               {c.DECODE_PORTE} AS porte,
+               nj.DESCR_NATUREZA_JURIDICA AS natureza,
+               LOWER(sr.DESCR_SITUACAO_RECEITA) AS situacao,
+               m.UF AS uf, mu.NOME_MUNICIPIO AS municipio,
+               m.COD_CLIENTE AS cnpj_matriz,
+               COALESCE(cn.DESCR_CNAE, m.COD_CNAE_PRINCIPAL) AS cnae_principal,
+               a.n_estab AS n_estab, a.n_ativos AS n_ativos
+        FROM {c.EMP} emp
+        LEFT JOIN matriz m ON emp.MIOLO_CNPJ = m.MIOLO_CNPJ
+        LEFT JOIN agreg a ON emp.MIOLO_CNPJ = a.MIOLO_CNPJ
+        LEFT JOIN {c.DEX_NATUREZA} nj
+          ON emp.COD_NATUREZA_JURIDICA = nj.COD_NATUREZA_JURIDICA
+        LEFT JOIN {c.DEX_SITUACAO} sr
+          ON m.COD_SITUACAO_RECEITA = sr.COD_SITUACAO_RECEITA
+        LEFT JOIN {c.DEX_MUNICIPIO} mu ON m.COD_MUNICIPIO = mu.COD_MUNICIPIO
+        LEFT JOIN {c.DEX_CNAE} cn ON m.COD_CNAE_PRINCIPAL = cn.COD_CNAE
+        WHERE emp.DATA_REFERENCIA = :safra_emp AND {filtro_emp}
+    """, {"safra_est": c.safra_de(c.EST), "safra_emp": c.safra_de(c.EMP),
+          "ativa": c.cod_situacao("ATIVA"), **binds_emp, **binds_est})
+
+
+@st.cache_data(ttl=3600, max_entries=200)
+def _filiais(basico: str, limite: int = 30, priorizar: str = "ativas") -> pd.DataFrame:
+    # priorizar segue o filtro de situacao da pagina: com 'inativas', as
+    # baixadas vem primeiro (senao o limite so pega ativas e o filtro zera).
+    direcao = "DESC" if priorizar != "inativas" else "ASC"
+    return db.query(f"""
+        SELECT e.COD_CLIENTE AS cnpj,
+               LOWER(sr.DESCR_SITUACAO_RECEITA) AS situacao,
+               e.UF AS uf, mu.NOME_MUNICIPIO AS municipio
+        FROM {c.EST} e
+        LEFT JOIN {c.DEX_SITUACAO} sr ON e.COD_SITUACAO_RECEITA = sr.COD_SITUACAO_RECEITA
+        LEFT JOIN {c.DEX_MUNICIPIO} mu ON e.COD_MUNICIPIO = mu.COD_MUNICIPIO
+        WHERE e.DATA_REFERENCIA = :safra AND e.MIOLO_CNPJ = :basico
+          AND e.IND_MATRIZ_FILIAL = '{c.COD_FILIAL}'
+        ORDER BY CASE WHEN e.COD_SITUACAO_RECEITA = :ativa THEN 1 ELSE 0 END {direcao},
+                 e.UF
+        FETCH FIRST :lim ROWS ONLY
+    """, {"safra": c.safra_de(c.EST), "ativa": c.cod_situacao("ATIVA"),
+          "basico": basico, "lim": limite})
+
+
+@st.cache_data(ttl=3600, max_entries=300)
+def conta_filiais(basico: str) -> tuple:
+    """(total, ativas) de filiais da empresa — pra avisar quando o grafo corta."""
+    r = db.query_um(f"""
+        SELECT COUNT(*),
+               SUM(CASE WHEN e.COD_SITUACAO_RECEITA = :ativa THEN 1 ELSE 0 END)
+        FROM {c.EST} e
+        WHERE e.DATA_REFERENCIA = :safra AND e.MIOLO_CNPJ = :basico
+          AND e.IND_MATRIZ_FILIAL = '{c.COD_FILIAL}'
+    """, {"safra": c.safra_de(c.EST), "ativa": c.cod_situacao("ATIVA"),
+          "basico": basico})
+    return (r[0], r[1] or 0) if r else (0, 0)
+
+
+def montar(seed_basico: str, niveis: int, max_nos: int,
+           incluir_representantes: bool, incluir_filiais: bool,
+           max_filiais: int = 30, priorizar_filiais: str = "ativas") -> Grafo:
+    """BFS alternado por nível:
+    nível 1 (ímpar): sócios/administradores das empresas conhecidas;
+    nível 2 (par): empresas ligadas aos sócios encontrados;
+    nível 3: sócios dessas empresas novas — e assim por diante."""
+    g = Grafo()
+    g.nos[f"emp:{seed_basico}"] = {"tipo": "empresa", "basico": seed_basico}
+    empresas_pendentes = {seed_basico}
+    empresas_vistas: set = set()
+    pf_pendentes: set = set()   # pares (nome, cpf) ainda não expandidos
+    pf_vistos: set = set()
+
+    for passo in range(1, max(1, niveis) + 1):
+        if len(g.nos) >= max_nos:
+            g.truncado = True
+            break
+
+        if passo % 2 == 1:
+            # ímpar: empresas pendentes -> seus sócios
+            if not empresas_pendentes:
+                break
+            lote = tuple(sorted(empresas_pendentes))
+            empresas_vistas |= empresas_pendentes
+            empresas_pendentes = set()
+
+            for s in _socios_das_empresas(lote).itertuples(index=False):
+                if len(g.nos) >= max_nos:
+                    g.truncado = True
+                    break
+                id_empresa = f"emp:{s.cnpj_basico}"
+
+                if s.tipo_socio == "pessoa juridica":
+                    pj_basico = (s.cpf_cnpj_socio or "")[:8]
+                    if len(pj_basico) == 8 and pj_basico.isdigit():
+                        id_socio = f"emp:{pj_basico}"
+                        g.nos.setdefault(id_socio, {"tipo": "empresa", "basico": pj_basico})
+                        if pj_basico not in empresas_vistas:
+                            empresas_pendentes.add(pj_basico)
+                    else:
+                        id_socio = _chave_pf(s.nome_socio, s.cpf_cnpj_socio)
+                        g.nos.setdefault(id_socio, {"tipo": "pj_ext", "nome": s.nome_socio})
+                else:
+                    id_socio = _chave_pf(s.nome_socio, s.cpf_cnpj_socio)
+                    g.nos.setdefault(id_socio, {
+                        "tipo": "pf" if s.tipo_socio == "pessoa fisica" else "estrangeiro",
+                        "nome": s.nome_socio, "cpf": s.cpf_cnpj_socio,
+                        "faixa": s.faixa_etaria, "pais": s.pais_socio,
+                    })
+                    if id_socio not in pf_vistos:
+                        pf_pendentes.add((s.nome_socio, s.cpf_cnpj_socio))
+                        pf_vistos.add(id_socio)
+
+                g.arestas.setdefault(
+                    (id_socio, id_empresa),
+                    (s.qualificacao or "sócio", s.data_entrada_sociedade or ""),
+                )
+
+                if incluir_representantes and s.nome_representante:
+                    id_rep = _chave_pf(s.nome_representante, s.representante_legal)
+                    g.nos.setdefault(id_rep, {
+                        "tipo": "pf", "nome": s.nome_representante,
+                        "cpf": s.representante_legal, "representante": True,
+                    })
+                    g.arestas.setdefault(
+                        (id_rep, id_socio),
+                        (f"representante ({s.qualificacao_representante or '?'})", ""),
+                    )
+        else:
+            # par: sócios PF pendentes -> outras empresas em que participam
+            if not pf_pendentes:
+                break
+            pares = tuple(sorted(pf_pendentes))
+            pf_pendentes = set()
+
+            outras = _empresas_dos_socios_pf(pares)
+            contagem = outras.groupby(["nome_socio", "cpf_cnpj_socio"]).size()
+            chaves_hub = set()
+            for (nome, cpf), n in contagem.items():
+                if n > LIMITE_HUB:
+                    chave = _chave_pf(nome, cpf)
+                    chaves_hub.add(chave)
+                    if chave in g.nos:
+                        g.nos[chave]["hub"] = int(n)
+                    g.hubs.append((nome, int(n)))
+
+            for r in outras.itertuples(index=False):
+                if len(g.nos) >= max_nos:
+                    g.truncado = True
+                    break
+                id_socio = _chave_pf(r.nome_socio, r.cpf_cnpj_socio)
+                if id_socio in chaves_hub:
+                    continue
+                id_emp = f"emp:{r.cnpj_basico}"
+                g.nos.setdefault(id_emp, {"tipo": "empresa", "basico": r.cnpj_basico})
+                g.arestas.setdefault(
+                    (id_socio, id_emp),
+                    (r.qualificacao or "sócio", r.data_entrada_sociedade or ""),
+                )
+                if r.cnpj_basico not in empresas_vistas:
+                    empresas_pendentes.add(r.cnpj_basico)
+
+    # enriquece nós de empresa com dados cadastrais
+    basicos = tuple(sorted({v["basico"] for v in g.nos.values() if v.get("tipo") == "empresa"}))
+    if basicos:
+        dados = _dados_empresas(basicos).set_index("cnpj_basico")
+        for no in g.nos.values():
+            if no.get("tipo") == "empresa" and no["basico"] in dados.index:
+                d = dados.loc[no["basico"]]
+                no.update({
+                    "razao": d.razao_social, "situacao": d.situacao, "uf": d.uf,
+                    "municipio": d.municipio, "porte": d.porte, "natureza": d.natureza,
+                    "cnpj_matriz": d.cnpj_matriz, "cnae": d.cnae_principal,
+                    "n_estab": int(d.n_estab) if pd.notna(d.n_estab) else 0,
+                    "n_ativos": int(d.n_ativos) if pd.notna(d.n_ativos) else 0,
+                })
+
+    # filiais como nós (opcional, só da empresa semente)
+    if incluir_filiais:
+        for f in _filiais(seed_basico, max_filiais, priorizar_filiais).itertuples(index=False):
+            id_fil = f"fil:{f.cnpj}"
+            g.nos[id_fil] = {"tipo": "filial", "cnpj": f.cnpj, "situacao": f.situacao,
+                             "uf": f.uf, "municipio": f.municipio}
+            g.arestas[(f"emp:{seed_basico}", id_fil)] = ("filial", "")
+
+    return g
+
+
+# Palavras que indicam poder de gestão/governança na qualificação da RFB.
+_GESTAO = ("ADMINISTRADOR", "DIRETOR", "PRESIDENTE", "CONSELHEIRO", "GERENTE",
+           "LIQUIDANTE", "INTERVENTOR", "INVENTARIANTE", "CURADOR", "TUTOR")
+
+
+def papel(qualificacao: str | None) -> str:
+    """Classifica o vínculo: 'gestão' (administra), 'capital' (só sócio) ou
+    'representação'. Sócio-Administrador conta como gestão."""
+    q = (qualificacao or "").upper()
+    if q.startswith("REPRESENTANTE"):
+        return "representação"
+    if any(p in q for p in _GESTAO):
+        return "gestão"
+    return "capital"
+
+
+def filtrar_situacao(g: Grafo, modo: str, seed_basico: str) -> Grafo:
+    """modo: 'todas' | 'ativas' | 'inativas'. Remove nós de empresa fora do
+    filtro (semente sempre fica), arestas órfãs e pessoas/filiais que
+    ficarem sem nenhum vínculo."""
+    if modo == "todas":
+        return g
+
+    def situacao_passa(no: dict) -> bool:
+        if no.get("basico") == seed_basico:
+            return True
+        situacao = no.get("situacao")
+        return (situacao == "ativa") if modo == "ativas" else (situacao != "ativa")
+
+    g2 = Grafo(truncado=g.truncado, hubs=list(g.hubs))
+    g2.nos = {
+        id_no: no for id_no, no in g.nos.items()
+        if no.get("tipo") not in ("empresa", "filial") or situacao_passa(no)
+    }
+    g2.arestas = {
+        (o, d): r for (o, d), r in g.arestas.items()
+        if o in g2.nos and d in g2.nos
+    }
+    conectados = {n for aresta in g2.arestas for n in aresta}
+    g2.nos = {
+        id_no: no for id_no, no in g2.nos.items()
+        if id_no in conectados or no.get("basico") == seed_basico
+    }
+    return g2
+
+
+@st.cache_data(ttl=3600, max_entries=300)
+def participacoes_pf(nome: str, cpf: str) -> pd.DataFrame:
+    """Todas as participações societárias de uma pessoa (nome + CPF mascarado),
+    com razão social e situação da matriz — alimenta o painel de detalhe."""
+    return db.query(f"""
+        SELECT s.MIOLO_CNPJ AS cnpj_basico, emp.RAZAO_SOCIAL AS razao_social,
+               q.DESCR_QUALIFICACAO AS qualificacao,
+               TO_CHAR(s.DATA_INICIO, 'DD/MM/YYYY') AS data_entrada_sociedade,
+               LOWER(sr.DESCR_SITUACAO_RECEITA) AS situacao, m.UF AS uf
+        FROM {c.SOC} s
+        LEFT JOIN {c.EMP} emp
+          ON s.MIOLO_CNPJ = emp.MIOLO_CNPJ AND emp.DATA_REFERENCIA = :safra_emp
+        LEFT JOIN {c.DEX_QUALIF} q ON s.COD_QUALIFICACAO_SOCIO = q.COD_QUALIFICACAO
+        LEFT JOIN (
+            SELECT e.MIOLO_CNPJ, e.COD_SITUACAO_RECEITA, e.UF
+            FROM {c.EST} e
+            WHERE e.DATA_REFERENCIA = :safra_est
+              AND e.IND_MATRIZ_FILIAL = '{c.COD_MATRIZ}'
+        ) m ON s.MIOLO_CNPJ = m.MIOLO_CNPJ
+        LEFT JOIN {c.DEX_SITUACAO} sr
+          ON m.COD_SITUACAO_RECEITA = sr.COD_SITUACAO_RECEITA
+        WHERE s.DATA_REFERENCIA = :safra
+          AND s.NOME_RAZAO_SOCIAL = :nome AND s.CPF_CNPJ_SOCIO = :cpf
+        ORDER BY s.DATA_INICIO DESC
+    """, {"safra": c.safra_de(c.SOC), "safra_emp": c.safra_de(c.EMP),
+          "safra_est": c.safra_de(c.EST), "nome": nome, "cpf": cpf})
+
+
+def para_dataframe(g: Grafo) -> pd.DataFrame:
+    """Arestas como tabela (pra exibir e exportar CSV do recorte atual)."""
+    linhas = []
+    for (origem, destino), (rotulo, desde) in g.arestas.items():
+        o, d = g.nos.get(origem, {}), g.nos.get(destino, {})
+        linhas.append({
+            "origem": o.get("nome") or o.get("razao") or origem,
+            "tipo_origem": o.get("tipo"),
+            "vinculo": rotulo,
+            "papel": "filial" if rotulo == "filial" else papel(rotulo),
+            "desde": desde,
+            "destino": d.get("razao") or d.get("nome") or d.get("cnpj") or destino,
+            "tipo_destino": d.get("tipo"),
+            "cnpj_destino": d.get("cnpj_matriz") or d.get("cnpj") or "",
+        })
+    return pd.DataFrame(linhas)

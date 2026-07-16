@@ -1,0 +1,10 @@
+# Observa mudancas tambem nos modulos de app/lib (nao so nas paginas):
+# sem isso, editar lib/*.py exige reiniciar o processo do Streamlit.
+[server]
+fileWatcherType = "watchdog"
+folderWatchBlacklist = []
+
+# Tema NAO e mais forcado: o grafo D3 (app/static/d3.v4.min.js) tem cores
+# proprias dentro do iframe e nao depende do tema do Streamlit. Sem [theme]
+# fixo, o menu do app (canto superior direito -> Settings) oferece
+# aparencia Light / Dark / Use system setting.
