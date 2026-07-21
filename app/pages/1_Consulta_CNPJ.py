@@ -76,6 +76,14 @@ def mostrar_ficha(cnpj: str) -> None:
         st.subheader(f"Estabelecimentos da empresa ({len(outros)})")
         st.dataframe(outros, use_container_width=True, hide_index=True)
 
+    # Inscrições Estaduais (RS) — só se a tabela ie_rs foi importada
+    # (scripts/importar_ie.py com o CSV da SEFAZ-RS, projeto da pasta IE/)
+    if consultas.tem_ie():
+        ies = consultas.ies_do_cnpj(basico)
+        if not ies.empty:
+            st.subheader(f"Inscrições Estaduais RS ({len(ies)})")
+            st.dataframe(ies, use_container_width=True, hide_index=True)
+
 
 if entrada:
     digitos = re.sub(r"\D", "", entrada)

@@ -36,10 +36,13 @@ with col_b:
         use_container_width=True,
     )
 
-cnae = consultas.top_cnaes()
+# carrega 50 de uma vez; o slider só fatia em memória (sem reconsulta)
+cnae = consultas.top_cnaes(limite=50)
 cnae["cnae_principal"] = cnae["cnae_principal"].str.slice(0, 70)
+top_n = st.slider("Quantos CNAEs mostrar", 5, 50, 15, step=5)
 st.plotly_chart(
-    estilo.barras_h(cnae, "cnae_principal", "ativos", "Top 15 CNAEs — estabelecimentos ativos"),
+    estilo.barras_h(cnae.head(top_n), "cnae_principal", "ativos",
+                    f"Top {top_n} CNAEs — estabelecimentos ativos"),
     use_container_width=True,
 )
 

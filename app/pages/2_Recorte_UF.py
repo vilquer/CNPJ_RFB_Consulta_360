@@ -49,19 +49,61 @@ with col_b:
         use_container_width=True,
     )
 
+st.subheader("Mapa — estabelecimentos ativos por município")
+if st.toggle("Exibir mapa coroplético", value=True,
+             help="Malha municipal baixada da API do IBGE (precisa de internet "
+                  "na primeira vez; depois fica em cache por 24h)."):
+    malha = consultas.malha_municipal(uf)
+    if malha is None:
+        st.warning("Não consegui baixar a malha do IBGE (offline?). Tente de novo.")
+    else:
+        import plotly.graph_objects as go
+
+        import numpy as np
+
+        dados_mapa = consultas.ativos_por_municipio_ibge(uf)
+        # escala log: linear deixa tudo pálido (a capital domina a régua)
+        z_log = np.log10(dados_mapa["ativos"].clip(lower=1))
+        ticks = [10, 100, 1_000, 10_000, 100_000]
+        fig = go.Figure(go.Choropleth(
+            geojson=malha,
+            featureidkey="properties.codarea",
+            locations=dados_mapa["codigo_ibge"],
+            z=z_log,
+            customdata=dados_mapa[["municipio", "ativos"]],
+            colorscale=[[0, "#cde2fb"], [0.5, "#3987e5"], [1, "#0d366b"]],
+            marker_line_color="#fcfcfb",
+            marker_line_width=0.4,
+            colorbar=dict(title="ativos", thickness=12,
+                          tickvals=[np.log10(t) for t in ticks],
+                          ticktext=["10", "100", "1 mil", "10 mil", "100 mil"]),
+            hovertemplate="%{customdata[0]}: %{customdata[1]:,.0f} ativos<extra></extra>",
+        ))
+        fig.update_geos(fitbounds="locations", visible=False)
+        fig.update_layout(
+            height=560, margin=dict(l=0, r=0, t=8, b=0),
+            paper_bgcolor="#fcfcfb",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Escala sequencial azul em **log** (claro = poucos ativos, "
+                   "escuro = muitos). Hover mostra o município e o valor real.")
+
 regiao = st.selectbox("Detalhar região", reg.regiao_intermediaria.tolist())
-mun = consultas.municipios_da_regiao(uf, regiao)
+# carrega 50 de cada; sliders fatiam em memória, sem reconsulta
+mun = consultas.municipios_da_regiao(uf, regiao, limite=50)
+cnae = consultas.top_cnaes(uf, limite=50)
+cnae["cnae_principal"] = cnae["cnae_principal"].str.slice(0, 55)
+top_n = st.slider("Quantos itens nos rankings", 5, 50, 15, step=5)
 col_c, col_d = st.columns(2)
 with col_c:
     st.plotly_chart(
-        estilo.barras_h(mun, "municipio", "ativos",
-                        f"Top municípios — {regiao}"),
+        estilo.barras_h(mun.head(top_n), "municipio", "ativos",
+                        f"Top {min(top_n, len(mun))} municípios — {regiao}"),
         use_container_width=True,
     )
 with col_d:
-    cnae = consultas.top_cnaes(uf)
-    cnae["cnae_principal"] = cnae["cnae_principal"].str.slice(0, 55)
     st.plotly_chart(
-        estilo.barras_h(cnae, "cnae_principal", "ativos", f"Top 15 CNAEs — {uf}"),
+        estilo.barras_h(cnae.head(top_n), "cnae_principal", "ativos",
+                        f"Top {top_n} CNAEs — {uf}"),
         use_container_width=True,
     )

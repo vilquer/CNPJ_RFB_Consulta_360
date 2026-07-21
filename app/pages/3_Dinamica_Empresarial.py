@@ -15,15 +15,27 @@ opcoes = ["Brasil"] + consultas.UFS
 escolha = st.selectbox("Recorte", opcoes)
 uf = None if escolha == "Brasil" else escolha
 
-st.subheader("Aberturas por ano (1985–2025)")
+st.subheader("Aberturas por ano")
 abert = consultas.aberturas_por_ano(uf)
+
+# filtro pós-carga: recorta o DataFrame já em memória — mexer no slider
+# não dispara query nova, só redesenha
+ano_min, ano_max = int(abert.ano.min()), int(abert.ano.max())
+periodo = st.slider("Período", ano_min, ano_max, (ano_min, ano_max),
+                    help="Filtra os gráficos abaixo sem reconsultar o banco.")
+abert_f = abert[(abert.ano >= periodo[0]) & (abert.ano <= periodo[1])]
+
 st.plotly_chart(
-    estilo.linha(abert, "ano", "aberturas", f"Estabelecimentos abertos por ano — {escolha}"),
+    estilo.linha(abert_f, "ano", "aberturas",
+                 f"Estabelecimentos abertos por ano — {escolha} "
+                 f"({periodo[0]}–{periodo[1]})"),
     use_container_width=True,
 )
+st.caption(f"Total no período: {abert_f.aberturas.sum():,.0f} aberturas · "
+           f"pico em {int(abert_f.loc[abert_f.aberturas.idxmax(), 'ano'])}")
 if uf:
     st.plotly_chart(
-        estilo.linha(abert, "ano", "fatia_pct",
+        estilo.linha(abert_f, "ano", "fatia_pct",
                      f"Fatia de {uf} nas aberturas do Brasil (%)",
                      cor=estilo.AQUA, fmt_hover=".1f", sufixo_y="%"),
         use_container_width=True,

@@ -24,16 +24,31 @@ _LAYOUT = dict(
 
 def barras_h(df, categoria: str, valor: str, titulo: str, cor: str = AZUL,
              fmt_hover: str = ",.0f") -> go.Figure:
-    """Barras horizontais, maior no topo, grade só no eixo do valor."""
-    d = df.sort_values(valor, ascending=True)
+    """Barras horizontais, maior no topo, grade só no eixo do valor.
+    Altura escala com o nº de barras — altura fixa faz o plotly pular
+    rótulos do eixo a partir de ~20 barras (parece que 'não mostra mais')."""
+    d = df.sort_values(valor, ascending=True).copy()
+    # Rótulos truncados podem colidir (dois CNAEs cortados em N chars viram
+    # o mesmo texto) e o plotly FUNDE categorias homônimas — barra dupla na
+    # mesma linha, fora de ordem. Zero-width space diferencia sem mudar o
+    # texto visível.
+    duplicado = d[categoria].duplicated(keep="first")
+    while duplicado.any():
+        d.loc[duplicado, categoria] = d.loc[duplicado, categoria] + "​"
+        duplicado = d[categoria].duplicated(keep="first")
+
+    altura = max(340, 26 * len(d) + 120)
     fig = go.Figure(go.Bar(
         x=d[valor], y=d[categoria], orientation="h",
         marker=dict(color=cor),
         hovertemplate=f"%{{y}}: %{{x:{fmt_hover}}}<extra></extra>",
     ))
-    fig.update_layout(**_LAYOUT, title_text=titulo, bargap=0.35, showlegend=False)
+    fig.update_layout(**_LAYOUT, title_text=titulo, bargap=0.35,
+                      showlegend=False, height=altura)
     fig.update_xaxes(gridcolor=GRID, zeroline=False, tickfont=dict(color=MUTED))
-    fig.update_yaxes(showgrid=False, tickfont=dict(color=INK_2))
+    fig.update_yaxes(showgrid=False, tickfont=dict(color=INK_2),
+                     automargin=True, tickmode="linear",
+                     categoryorder="total ascending")
     return fig
 
 
